@@ -64,8 +64,9 @@ typedef unsigned long length_t;
 struct httpc {
 	httpc_options_t os;
 	httpc_callback snd, rcv;
+	httpc_field_callback fld;
 	buffer_t b0, burl; /* buffers for temporary values, heavily reused, be careful! */
-	void *snd_param, *rcv_param;
+	void *snd_param, *rcv_param, *fld_param;
 	/* These strings point into 'url', which has been modified from the
 	 * original URL to contain a bunch of NUL terminated strings where the
 	 * delimiters were */
@@ -759,6 +760,12 @@ static int httpc_parse_response_field(httpc_t *h, char *line, size_t length) {
 			return fatal(h, "invalid state");
 		}
 	}
+	// add custom handler for field EDIT
+	if(h->fld != NULL){
+		int res = (*h->fld)(line, length, h->fld_param);
+		if (res == 0)
+			return info(h, "unknown field handled by custom handler: %s", line);
+	}
 	return info(h, "unknown field: %s", line);
 }
 
@@ -1305,16 +1312,16 @@ int httpc_end_session(httpc_options_t *a) {
 	return HTTPC_OK;
 }
 
-static int httpc_op_stack(httpc_options_t *a, const char *url, int op, httpc_callback rcv, void *rcv_param, httpc_callback snd, void *snd_param) {
+static int httpc_op_stack(httpc_options_t *a, const char *url, int op, httpc_callback rcv, void *rcv_param, httpc_callback snd, void *snd_param, httpc_field_callback fld,  void * fld_param) {
 	if (a->state)
 		return HTTPC_ERROR;
-	httpc_t h = { .os = *a, .rcv = rcv, .rcv_param = rcv_param, .snd = snd, .snd_param = snd_param, };
+	httpc_t h = { .os = *a, .rcv = rcv, .rcv_param = rcv_param, .snd = snd, .snd_param = snd_param, .fld = fld, .fld_param = fld_param};
 	assert(httpc_is_yield_on(&h) == 0);
 	assert(httpc_is_reuse(&h)    == 0);
 	return httpc_state_machine(&h, url, op);
 }
 
-static int httpc_op_heap(httpc_options_t *a, const char *url, int op, httpc_callback rcv, void *rcv_param, httpc_callback snd, void *snd_param) {
+static int httpc_op_heap(httpc_options_t *a, const char *url, int op, httpc_callback rcv, void *rcv_param, httpc_callback snd, void *snd_param, httpc_field_callback fld, void * fld_param) {
 	assert(a);
 	assert(url);
 	httpc_t *h = a->state;
@@ -1451,7 +1458,7 @@ int httpc_get_buffer(httpc_options_t *a, const char *url, char *buffer, size_t *
 		return HTTPC_ERROR;
 	buffer_cb_t param = { .buffer = buffer, .length = *length, };
 	*length  = 0;
-	const int r = httpc_op_stack(a, url, HTTPC_GET, httpc_get_buffer_cb, &param, NULL, NULL);
+	const int r = httpc_op_stack(a, url, HTTPC_GET, httpc_get_buffer_cb, &param, NULL, NULL, NULL, NULL);
 	if (r == HTTPC_OK)
 		*length = param.used;
 	return r;
@@ -1464,7 +1471,7 @@ int httpc_put_buffer(httpc_options_t *a, const char *url, char *buffer, size_t l
 	if (httpc_buffer_unsupported(a))
 		return HTTPC_ERROR;
 	buffer_cb_t param = { .buffer = buffer, .length = length, .used = length, };
-	return httpc_op_stack(a, url, HTTPC_PUT, NULL, NULL, httpc_put_buffer_cb, &param);
+	return httpc_op_stack(a, url, HTTPC_PUT, NULL, NULL, httpc_put_buffer_cb, &param,NULL, NULL);
 }
 
 int httpc_post_buffer(httpc_options_t *a, const char *url, char *buffer, size_t length) {
@@ -1474,7 +1481,7 @@ int httpc_post_buffer(httpc_options_t *a, const char *url, char *buffer, size_t 
 	if (httpc_buffer_unsupported(a))
 		return HTTPC_ERROR;
 	buffer_cb_t param = { .buffer = buffer, .length = length, .used = length, };
-	return httpc_op_stack(a, url, HTTPC_POST, NULL, NULL, httpc_put_buffer_cb, &param);
+	return httpc_op_stack(a, url, HTTPC_POST, NULL, NULL, httpc_put_buffer_cb, &param,NULL, NULL);
 }
 
 static inline int httpc_testing_sleep(unsigned long milliseconds) {
@@ -1694,7 +1701,7 @@ int httpc_tests(httpc_options_t *a) {
 		httpc_t h = { .os = *a, };
 		a->socketopts = &h;
 		info(&h, "Test GET on URL '%s'", ft->file);
-		const int code = httpc_get(a, ft->file, NULL, NULL);
+		const int code = httpc_get(a, ft->file, NULL, NULL,NULL, NULL);
 		if (code != ft->error)
 			r = error(&h, "Test GET on URL '%s' failed: got %d and expected %d", ft->file, code, ft->error);
 		else

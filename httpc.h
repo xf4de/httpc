@@ -29,6 +29,9 @@ enum {
 
 typedef int (*httpc_callback)(void *param, unsigned char *buf, size_t length, size_t position);
 
+// EDIT // handle unknown headers (receives header line)
+typedef int (*httpc_field_callback)(char * line, size_t length, void * param);
+
 struct httpc_options {
 	allocator_fn allocator;
 
@@ -64,9 +67,11 @@ struct httpc;
 typedef struct httpc httpc_t;
 
 /* all functions: return negative on failure, zero or positive on success */
-HTTPC_API int httpc_get(httpc_options_t *a, const char *url, httpc_callback fn, void *param);
+// HTTPC_API int httpc_get(httpc_options_t *a, const char *url, httpc_callback fn, void *param);
+int httpc_get(httpc_options_t *a, const char *url, httpc_callback fn, void *param, httpc_field_callback fld, void * fld_param);
 HTTPC_API int httpc_put(httpc_options_t *a, const char *url, httpc_callback fn, void *param); /* fn should return size, 0 on stop, -1 on failure */
-HTTPC_API int httpc_post(httpc_options_t *a, const char *url, httpc_callback fn, void *param); /* fn should return size, 0 on stop, -1 on failure */
+// HTTPC_API int httpc_post(httpc_options_t *a, const char *url, httpc_callback fn, void *param); /* fn should return size, 0 on stop, -1 on failure */
+HTTPC_API int httpc_post(httpc_options_t *a, const char *url, httpc_callback fn, void *param, httpc_field_callback fld, void * fld_param); /* fn should return size, 0 on stop, -1 on failure */
 HTTPC_API int httpc_get_buffer(httpc_options_t *a, const char *url, char *buffer, size_t *length); /* store GET to buffer */
 HTTPC_API int httpc_put_buffer(httpc_options_t *a, const char *url, char *buffer, size_t length); /* PUT from buffer */
 HTTPC_API int httpc_post_buffer(httpc_options_t *a, const char *url, char *buffer, size_t length); /* POST from buffer */
