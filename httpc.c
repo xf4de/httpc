@@ -73,6 +73,7 @@ struct httpc {
 	char *domain /* or IPv4/IPv6 */, *userpass, *path, *url;
 	void *socket;
 	length_t position, length, max;
+	length_t prev_length; /* for retry partial content remaining length handling */
 	int state, status;
 	unsigned long start_ms, current_ms, end_ms;
 	unsigned retries, redirects; /* retry count, redirect count */
@@ -87,7 +88,9 @@ struct httpc {
 		 length_set    :1, /* has length been set on a PUT/POST? */
 		 open          :1, /* is the file handle open? */
 		 keep_alive    :1, /* does the server support keep-alive? */
-		 progress      :1; /* are we making progress? */
+		 progress      :1, /* are we making progress? */
+		 range_or_full :1, /* if current response is 206 partial content or 200 full content  1 = partial*/
+		 is_retry	   :1; /* if set then a retry is going on */
 };
 
 static inline void reverse(char * const r, const size_t length) {
@@ -538,7 +541,9 @@ static int httpc_request_send_header(httpc_t *h, buffer_t *b0, int op) {
 		goto fail;
 	if (buffer_add_string(h, b0, "\r\n") < 0)
 		goto fail;
-	if (op == HTTPC_GET && h->os.flags & HTTPC_OPT_HTTP_1_0 && h->position && h->accept_ranges) {
+	info(h,"os flags %d %d, pos %ld, ranges %d", h->os.flags & HTTPC_OPT_HTTP_1_0, h->os.flags, h->position, h->accept_ranges);
+	// if (op == HTTPC_GET && h->os.flags & HTTPC_OPT_HTTP_1_0 && h->position && h->accept_ranges) {
+	if (op == HTTPC_GET && h->position && h->accept_ranges) {
 		char range[64 + 1] = { 0 };
 		if (buffer_add_string(h, b0, "Range: bytes=") < 0)
 			goto fail;
@@ -703,7 +708,12 @@ static int httpc_parse_response_field(httpc_t *h, char *line, size_t length) {
 		switch (fld->type) {
 		case FLD_ACCEPT_RANGES:
 			if (httpc_case_insensitive_search(line, "bytes")) {
-				h->accept_ranges = !!(h->os.flags & HTTPC_OPT_HTTP_1_0);
+				// h->accept_ranges = !!(h->os.flags & HTTPC_OPT_HTTP_1_0);
+				h->accept_ranges = 1;
+				
+				if(h->range_or_full){ // if response is range and it is a retry keep original length
+					h->length = h->prev_length; // keep original length for retry
+				}
 				return info(h, "Accept-Ranges: bytes");
 			}
 			if (httpc_case_insensitive_search(line, "none")) {
@@ -735,6 +745,21 @@ static int httpc_parse_response_field(httpc_t *h, char *line, size_t length) {
 			}
 			return error(h, "unknown connection type");
 		case FLD_CONTENT_LENGTH:
+			// edit (do not update content-length for retry range request)
+			info(h,"FLD_CONTENT_LENGTH prev_length %lu, retries %u is retry %d",h->prev_length, h->retries, h->is_retry);
+			if(h->prev_length > 0 && h->is_retry){
+				length_t tmp = 0;
+				if (scan_number(&line[fld->length], &h->length, 10) < 0){
+					return error(h, "invalid content length: %s", line);
+				}
+				tmp = h->length;
+				if(h->accept_ranges && h->range_or_full){ // handle range if accept range is already parsed
+					h->length = h->prev_length; // keep original length
+				}
+				h->length_set = 1;
+				return info(h,"received retry content-legth %lu, h->length %lu", (unsigned long)tmp, (unsigned long)h->length);
+				
+			}
 			if (scan_number(&line[fld->length], &h->length, 10) < 0)
 				return error(h, "invalid content length: %s", line);
 			h->length_set = 1;
@@ -852,6 +877,9 @@ static int httpc_parse_response_header_start_line(httpc_t *h, char *line, const 
 			&& 0 != httpc_case_insensitive_compare(ok, "Partial Content", 15)
 			))
 			return error(h, "unexpected HTTP response: %s", ok);
+		if(h->response == 206){
+			h->range_or_full = 1;
+		}
 	}
 	return HTTPC_OK;
 }
@@ -865,6 +893,7 @@ static int httpc_parse_response_header(httpc_t *h, buffer_t *b0) {
 	h->v1 = 0;
 	h->v2 = 0;
 	h->response = 0;
+	h->prev_length = (h->is_retry || h->retries > 0) ? h->length : 0; // save original length
 	h->length = 0;
 	h->identity = 1;
 	h->length_set = 0;
@@ -873,8 +902,12 @@ static int httpc_parse_response_header(httpc_t *h, buffer_t *b0) {
 	b0->used = 0;
 
 	length = b0->allocated;
-	if (httpc_read_until_line_end(h, b0, &length) < 0)
+	if (httpc_read_until_line_end(h, b0, &length) < 0){
+		// if retry cannot read header in a multiple retry range request lenght is lost.
+		// store it to preserve original length
+		h->length = h->prev_length;
 		return error(h, "protocol error (could not read first line)");
+	}
 	hlen += length;
 	info(h, "HEADER: %s/%lu", b0->buffer, (unsigned long)length);
 
@@ -890,6 +923,15 @@ static int httpc_parse_response_header(httpc_t *h, buffer_t *b0) {
 			return error(h, "error parsing response line");
 		if ((hlen + length) < hlen)
 			return fatal(h, "overflow in length");
+	}
+
+	// handle partial content or full content for retry
+	if(h->range_or_full == 0){
+		info(h, "is retry? pos %ld, retry %d",h->position, h->is_retry );
+		// if retry reset position
+		// since this block is called when this is not a partial content response (full content)
+		if(h->is_retry)
+			h->position = 0;
 	}
 
 	return info(h, "header done");
@@ -1229,7 +1271,9 @@ next_state:
 			next      = SM_DONE;
 			break;
 		}
+		info(h, "retries %d, progress %d, val %d", h->retries, h->progress, !(h->progress));
 		h->retries += !(h->progress);
+		h->is_retry = 1; // has entered backoff (has retried even when making progress, e.g. recvd partial body)
 		h->progress = 0;
 		h->redirect = 0;
 
@@ -1251,6 +1295,7 @@ next_state:
 	}
 	case SM_DONE:
 		h->retries   = 0;
+		h->is_retry  = 0;
 		h->redirects = 0;
 		if (h->open) {
 			if (httpc_is_reuse(h) && !httpc_is_dead(h) && h->status == HTTPC_OK && h->keep_alive) {
