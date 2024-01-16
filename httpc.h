@@ -77,6 +77,9 @@ HTTPC_API int httpc_options(httpc_options_t *a, const char *url);
 HTTPC_API int httpc_end_session(httpc_options_t *a);
 HTTPC_API int httpc_tests(httpc_options_t *a);
 
+//edit
+int httpc_post_body(httpc_options_t *a, const char *url, httpc_callback fn_post, void *param_post, httpc_callback fn_body, void * param_body, httpc_field_callback fld, void * fld_param);
+
 /* You provide these functions and populate 'httpc_options_t' with them when porting to a new platform 
  * (ie. Not Unix or Windows) - return negative on failure, zero (HTTPC_OK) on success, and for 
  * open/close/read/write return HTTPC_YIELD if you want the client to yield to its' caller. */

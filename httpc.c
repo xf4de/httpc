@@ -14,11 +14,11 @@
 #include <limits.h>
 
 #ifndef HTTPC_STACK_BUFFER_SIZE /* buffers allocated on the stack, responsible for some arbitrary limits as well. */
-#define HTTPC_STACK_BUFFER_SIZE (128ul)
+#define HTTPC_STACK_BUFFER_SIZE (256ul) /* EDIT */
 #endif
 
 #ifndef HTTPC_TESTS_ON /* Build in tests to the program */
-#define HTTPC_TESTS_ON (1u)
+#define HTTPC_TESTS_ON (0u)
 #endif
 
 #ifndef HTTPC_GROW /* Allow data structures to grow */
@@ -570,8 +570,9 @@ static int httpc_request_send_header(httpc_t *h, buffer_t *b0, int op) {
 		if (buffer_add_string(h, b0, "Connection: close\r\n") < 0)
 			goto fail;
 	}
-	if (buffer_add_string(h, b0, "Accept-Encoding: identity\r\n") < 0)
-		goto fail;
+	// EDIT: remove accept-encoding header to reduce request size
+	// if (buffer_add_string(h, b0, "Accept-Encoding: identity\r\n") < 0)
+	// 	goto fail;
 	if (h->userpass) {
 		const size_t upl = strlen(h->userpass);
 		if (buffer_add_string(h, b0, "Authorization: Basic ") < 0)
@@ -837,7 +838,12 @@ static int httpc_parse_response_header_start_line(httpc_t *h, char *line, const 
 	if (h->response < 200 || h->response > 399)
 		return error(h, "invalid response number: %u", h->response);
 	if (h->response >= 200 && h->response <= 299) {
-		if (ok[0] == '\0' || ok[1] == '\0' || 0 != httpc_case_insensitive_compare(ok, "OK", 2))
+		/* EDIT handle NO CONTENT and partial content*/
+		if (ok[0] == '\0' || ok[1] == '\0' || 
+			(0 != httpc_case_insensitive_compare(ok, "OK", 2) &&
+			0 != httpc_case_insensitive_compare(ok, "NO CONTENT", 10)
+			&& 0 != httpc_case_insensitive_compare(ok, "Partial Content", 15)
+			))
 			return error(h, "unexpected HTTP response: %s", ok);
 	}
 	return HTTPC_OK;
@@ -908,6 +914,11 @@ static int httpc_parse_response_body_identity(httpc_t *h, buffer_t *b0) {
 
 	b0->used = 0;
 	for (;;) {
+		// EDIT!
+		// early exit in case of content length 0
+		if (h->length_set && h->length == 0)
+			return info(h, "zero content length, nothing to read");
+
 		size_t length = b0->allocated;
 		if (httpc_network_read(h, b0->buffer, &length) < 0)
 			return error(h, "read error");
@@ -1111,14 +1122,17 @@ next_state:
 		if (h->retries_max == 0)
 			h->retries_max = HTTPC_CONNECTION_ATTEMPTS;
 		if (h->redirects_max == 0)
-			h->retries_max = HTTPC_REDIRECT_MAX;
+			h->redirects_max = HTTPC_REDIRECT_MAX;
 		break;
 	case SM_OPEN: {
 		next = SM_SNDH;
 		implies(h->open, httpc_is_reuse(h));
 		implies(h->open, h->keep_alive);
 		if (h->open) /* reuse connection */
+		{// EDIT PARSE URL EVEN IF REUSE
+			if (httpc_parse_url(h, url) < 0) { h->status = HTTPC_ERROR; next = SM_DONE; break; }
 			break;
+		}
 		const int y = h->os.open(&h->socket, &h->os, h->os.socketopts, h->domain, h->port, h->use_ssl);
 		if (y == HTTPC_OK)
 			h->open = 1;
@@ -1170,7 +1184,8 @@ next_state:
 	}
 	case SM_RCVB:
 		next = SM_DONE;
-		if (op == HTTPC_GET) {
+//		if (op == HTTPC_GET) {
+		if(h->rcv != NULL){ // edit (allow post body)
 			const length_t pos = h->position;
 			h->progress = 0;
 			const int r = httpc_parse_response_body(h);
@@ -1314,63 +1329,86 @@ static int httpc_op_heap(httpc_options_t *a, const char *url, int op, httpc_call
 		h->snd       = snd;
 		h->rcv_param = rcv_param;
 		h->snd_param = snd_param;
-	}
+		h->fld 		 = fld; //EDIT
+		h->fld_param = fld_param; // EDIT
+	} 
+	// edit for connection reuse
+	h->rcv       = rcv;
+	h->snd       = snd;
+	h->rcv_param = rcv_param;
+	h->snd_param = snd_param;
+	h->fld 		 = fld; //EDIT
+	h->fld_param = fld_param; // EDIT
+	// update content length for put/post
+	h->length_set = 0;
+	h->position = 0;
+	h->length = 0;
+	h->max = 0;
+	h->progress = 0;
+
 	const int r = httpc_state_machine(h, url, op);
 	if (r != HTTPC_YIELD && r != HTTPC_REUSE)
 		a->state = NULL; /* make sure this is not reused */
 	return r;
 }
 
-static int httpc_operation(httpc_options_t *a, const char *url, int op, httpc_callback rcv, void *rcv_param, httpc_callback snd, void *snd_param) {
+static int httpc_operation(httpc_options_t *a, const char *url, int op, httpc_callback rcv, void *rcv_param, httpc_callback snd, void *snd_param, httpc_field_callback fld, void * fld_param) {
 	assert(a);
 	assert(url);
 	const int yield = !!(a->flags & HTTPC_OPT_NON_BLOCKING);
 	const int reuse = !!(a->flags & HTTPC_OPT_REUSE);
 	if (yield || reuse)
-		return httpc_op_heap(a, url, op, rcv, rcv_param, snd, snd_param);
-	return httpc_op_stack(a, url, op, rcv, rcv_param, snd, snd_param);
+		return httpc_op_heap(a, url, op, rcv, rcv_param, snd, snd_param, fld, fld_param);
+	return httpc_op_stack(a, url, op, rcv, rcv_param, snd, snd_param, fld, fld_param);
 }
 
-int httpc_get(httpc_options_t *a, const char *url, httpc_callback fn, void *param) {
+int httpc_get(httpc_options_t *a, const char *url, httpc_callback fn, void *param, httpc_field_callback fld, void * fld_param) {
 	assert(a);
 	assert(url);
-	return httpc_operation(a, url, HTTPC_GET, fn, param, NULL, NULL);
+	return httpc_operation(a, url, HTTPC_GET, fn, param, NULL, NULL, fld, fld_param);
 }
 
 int httpc_put(httpc_options_t *a, const char *url, httpc_callback fn, void *param) {
 	assert(a);
 	assert(url);
-	return httpc_operation(a, url, HTTPC_PUT, NULL, NULL, fn, param);
+	return httpc_operation(a, url, HTTPC_PUT, NULL, NULL, fn, param, NULL, NULL);
 }
 
-int httpc_post(httpc_options_t *a, const char *url, httpc_callback fn, void *param) {
+int httpc_post(httpc_options_t *a, const char *url, httpc_callback fn, void *param, httpc_field_callback fld, void * fld_param) {
 	assert(a);
 	assert(url);
-	return httpc_operation(a, url, HTTPC_POST, NULL, NULL, fn, param);
+	return httpc_operation(a, url, HTTPC_POST, NULL, NULL, fn, param, fld, fld_param);
+}
+
+// edit post with response body
+int httpc_post_body(httpc_options_t *a, const char *url, httpc_callback fn_post, void *param_post, httpc_callback fn_body, void * param_body, httpc_field_callback fld, void * fld_param) {
+	assert(a);
+	assert(url);
+	return httpc_operation(a, url, HTTPC_POST, fn_body, param_body, fn_post, param_post, fld, fld_param);
 }
 
 int httpc_head(httpc_options_t *a, const char *url) {
 	assert(a);
 	assert(url);
-	return httpc_operation(a, url, HTTPC_HEAD, NULL, NULL, NULL, NULL);
+	return httpc_operation(a, url, HTTPC_HEAD, NULL, NULL, NULL, NULL, NULL, NULL);
 }
 
 int httpc_delete(httpc_options_t *a, const char *url) { /* NB. A DELETE body is technically allowed... */
 	assert(a);
 	assert(url);
-	return httpc_operation(a, url, HTTPC_DELETE, NULL, NULL, NULL, NULL);
+	return httpc_operation(a, url, HTTPC_DELETE, NULL, NULL, NULL, NULL, NULL, NULL);
 }
 
 int httpc_trace(httpc_options_t *a, const char *url) {
 	assert(a);
 	assert(url);
-	return httpc_operation(a, url, HTTPC_TRACE, NULL, NULL, NULL, NULL);
+	return httpc_operation(a, url, HTTPC_TRACE, NULL, NULL, NULL, NULL, NULL, NULL);
 }
 
 int httpc_options(httpc_options_t *a, const char *url) {
 	assert(a);
 	assert(url);
-	return httpc_operation(a, url, HTTPC_OPTIONS, NULL, NULL, NULL, NULL);
+	return httpc_operation(a, url, HTTPC_OPTIONS, NULL, NULL, NULL, NULL, NULL, NULL);
 }
 
 static int httpc_get_buffer_cb(void *param, unsigned char *buf, size_t length, size_t position) {
